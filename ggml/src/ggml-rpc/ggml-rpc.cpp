@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "transport.h"
+#include "rpc-rle.h"
 
 #include <array>
 #include <cinttypes>
@@ -77,6 +78,9 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    // sent only to servers that advertise RPC_FEATURE_SET_TENSOR_RLE in
+    // their HELLO reply
+    RPC_CMD_SET_TENSOR_RLE,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -86,6 +90,14 @@ static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
+// Try RPC_CMD_SET_TENSOR_RLE for float data at least this large
+const size_t RLE_THRESHOLD = 64 * 1024;
+
+// Feature bits in rpc_msg_hello_rsp.features. That byte used to be padding
+// and older servers send it as zero, so the protocol version stays the
+// same and older and newer builds keep talking to each other.
+const uint8_t RPC_FEATURE_SET_TENSOR_RLE = 1;
+
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
@@ -94,7 +106,7 @@ struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t features;
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -174,6 +186,15 @@ struct rpc_msg_set_tensor_hash_req {
 
 struct rpc_msg_set_tensor_hash_rsp {
     uint8_t result;
+};
+
+// followed by n_runs rpc_rle_run
+struct rpc_msg_set_tensor_rle_req {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
+    uint32_t word;
+    uint32_t n_runs;
 };
 
 struct rpc_msg_get_tensor_req {
@@ -344,7 +365,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & features) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -359,6 +380,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
+    features = response.features;
     sock->update_caps(response.conn_caps);
     return true;
 }
@@ -421,6 +443,9 @@ public:
 
     void start(const std::string & endpoint);
     void work();
+
+    // RPC_FEATURE_* bits from the server's HELLO reply
+    uint8_t server_features = 0;
 
     ~rpc_dispatcher();
 
@@ -546,7 +571,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock)) {
+    if (!negotiate_hello(sock, server_features)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -717,9 +742,53 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
     return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 }
 
+// Sends the data run-length coded if the server supports it and the data
+// compresses to under an eighth of its size. Returns false, having sent
+// nothing, when the caller should use the normal path.
+static bool ggml_backend_rpc_try_set_tensor_rle(const std::shared_ptr<rpc_dispatcher> & dispatcher, const rpc_tensor & rpc_tensor,
+                                                const void * data, size_t offset, size_t size, bool async) {
+    if (!(dispatcher->server_features & RPC_FEATURE_SET_TENSOR_RLE) || size < RLE_THRESHOLD) {
+        return false;
+    }
+    uint32_t word;
+    switch (rpc_tensor.type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16: word = 2; break;
+        case GGML_TYPE_F32:  word = 4; break;
+        default: return false;
+    }
+    std::vector<rpc_rle_run> runs;
+    if (!rpc_rle_encode((const uint8_t *)data, size, word, runs)) {
+        return false;
+    }
+    // input serialization format: | rpc_msg_set_tensor_rle_req | runs (n_runs * 8 bytes) |
+    rpc_msg_set_tensor_rle_req header;
+    header.tensor = rpc_tensor;
+    header.offset = offset;
+    header.size   = size;
+    header.word   = word;
+    header.n_runs = (uint32_t)runs.size();
+    size_t input_size = sizeof(header) + runs.size() * sizeof(rpc_rle_run);
+    uint8_t * input = new uint8_t[input_size]();
+    memcpy(input, &header, sizeof(header));
+    memcpy(input + sizeof(header), runs.data(), runs.size() * sizeof(rpc_rle_run));
+    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+    if (async) {
+        dispatcher->send_async(RPC_CMD_SET_TENSOR_RLE, input_ptr, input_size);
+    } else {
+        dispatcher->send(RPC_CMD_SET_TENSOR_RLE, input_ptr, input_size);
+    }
+    return true;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    // weights keep the hash-cache path; everything else may go run-length coded
+    if (!rpc_use_hash_cache(tensor, size) &&
+        ggml_backend_rpc_try_set_tensor_rle(ctx->dispatcher, rpc_tensor, data, offset, size, false)) {
+        return;
+    }
     uint8_t cache_flag = 0;
     if (rpc_use_hash_cache(tensor, size)) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
@@ -952,6 +1021,11 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    // weights keep the hash-cache path; everything else may go run-length coded
+    if (!rpc_use_hash_cache(tensor, size) &&
+        ggml_backend_rpc_try_set_tensor_rle(ctx->dispatcher, rpc_tensor, data, offset, size, true)) {
+        return;
+    }
     uint8_t cache_flag = 0;
     if (rpc_use_hash_cache(tensor, size)) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
@@ -1167,6 +1241,7 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor_rle(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1201,6 +1276,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
+    response.features = RPC_FEATURE_SET_TENSOR_RLE;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
 }
 
@@ -1477,6 +1553,60 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
+    return true;
+}
+
+bool rpc_server::set_tensor_rle(const std::vector<uint8_t> & input) {
+    // serialization format: | rpc_msg_set_tensor_rle_req | runs (n_runs * 8 bytes) |
+    if (input.size() < sizeof(rpc_msg_set_tensor_rle_req)) {
+        return false;
+    }
+    rpc_msg_set_tensor_rle_req header;
+    memcpy(&header, input.data(), sizeof(header));
+    if ((input.size() - sizeof(header)) / sizeof(rpc_rle_run) != header.n_runs ||
+        (input.size() - sizeof(header)) % sizeof(rpc_rle_run) != 0) {
+        GGML_LOG_ERROR("[%s] run count %u does not match message size %zu\n", __func__, header.n_runs, input.size());
+        return false;
+    }
+    const uint64_t offset = header.offset;
+    const size_t size = header.size;
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, &header.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, runs: %u\n", __func__, (void*)tensor->buffer, tensor->data, offset, size, header.n_runs);
+
+    // sanitize tensor->data, same check as set_tensor
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        if (header.tensor.data + offset < p0 || header.tensor.data + offset >= p1 || size > (p1 - header.tensor.data - offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
+                           __func__, header.tensor.data, offset, size, p0, p1);
+            return false;
+        }
+    }
+
+    std::vector<rpc_rle_run> runs(header.n_runs);
+    memcpy(runs.data(), input.data() + sizeof(header), runs.size() * sizeof(rpc_rle_run));
+    std::vector<uint8_t> data(size);
+    if (!rpc_rle_decode(runs.data(), runs.size(), header.word, data.data(), size)) {
+        GGML_LOG_ERROR("[%s] malformed runs (word=%u, runs=%u, size=%zu)\n", __func__, header.word, header.n_runs, size);
+        return false;
+    }
+    // Deliberately not written to cache_dir: this is per-batch input, not a weight.
+    ggml_backend_tensor_set(tensor, data.data(), offset, size);
     return true;
 }
 
@@ -1987,6 +2117,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_RLE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_rle(input)) {
                     return;
                 }
                 break;
