@@ -708,6 +708,30 @@ static bool set_reuse_addr(sockfd_t sockfd) {
     return ret == 0;
 }
 
+// A client that disappears without closing its connection (power loss,
+// pulled cable) sends no FIN or RST, and the server, which serves one client
+// at a time, would wait on it forever and never accept the next one.
+// Keepalive probes end such a session: a client that has restarted answers
+// the first probe with a RST, and one that stays unreachable is dropped
+// after the last unanswered probe (about 5 minutes).
+static bool set_keep_alive(sockfd_t sockfd) {
+    int flag = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (char *)&flag, sizeof(int)) != 0) {
+        return false;
+    }
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+    int idle  = 30; // seconds of silence before the first probe
+    int intvl = 30; // seconds between probes
+    int cnt   = 10; // unanswered probes before the connection is dropped
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE,  (char *)&idle,  sizeof(int)) != 0 ||
+        setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, (char *)&intvl, sizeof(int)) != 0 ||
+        setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT,   (char *)&cnt,   sizeof(int)) != 0) {
+        return false;
+    }
+#endif
+    return true;
+}
+
 socket_ptr socket_t::accept() {
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
@@ -716,6 +740,9 @@ socket_ptr socket_t::accept() {
     if (!set_no_delay(client_socket_fd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
+    }
+    if (!set_keep_alive(client_socket_fd)) {
+        LOG_WARN("Failed to set TCP keepalive, a vanished client will block the server\n");
     }
     LOG_DBG("[%s] accepted client connection\n", __func__);
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
